@@ -190,3 +190,175 @@ def repo_find(path=".", required=True):
 #---------------------------------- HASH OBJECT & CAT FILE --------------------------------#
 ############################################################################################
 
+class GitObject(object): # base class for all git objects (a generic object object)
+    def __init__(self, data=None): # constructor
+        if data != None:
+            self.deserialize(data)
+        else:
+            self.init()
+    
+    def serialize(self, repo): # serialize the object
+        """This function will be implemented by subclasses.
+        
+        It must read the object's contents from self.data, a byte string, and do whatever it takes to convert it into a meaningful representation.
+        What exactly that means depends on each subclass (the type of object, so this is an abstract method.)"""
+        raise Exception("Unimplemented!")
+    
+    def deserialize(self, data): # deserialize the object
+        raise Exception("Unimplemented!") # this is an abstract method
+    
+    def init(self): # initialize the object
+        pass # Just do nothing. Subclasses can implement it if they want. This is reasonable default!
+
+# to read an object, we need to know its SHA-1 hash.
+def object_read(repo, sha): # read an object from the repository
+    """Read object sha from Git repository repo.  Return a
+    GitObject whose exact type depends on the object."""
+
+    path = repo_file(repo, "objects", sha[0:2], sha[2:]) # get the path of the object
+
+    if not os.path.isfile(path): # if the object does not exist
+        return None # return None
+
+    with open (path, "rb") as f: # open the object file
+        raw = zlib.decompress(f.read()) # read the object file and decompress it
+
+        # Read object type
+        x = raw.find(b' ') # find the first space
+        fmt = raw[0:x] # get the object type
+
+        # Read and validate object size
+        y = raw.find(b'\x00', x) # find the first null byte
+        size = int(raw[x:y].decode("ascii")) # get the object size
+        if size != len(raw)-y-1: # if the size is not equal to the length of the object
+            raise Exception("Malformed object {0}: bad length".format(sha)) # raise an exception
+
+        # Pick constructor
+        if fmt == b'commit':
+            c = GitCommit # if the object is a commit
+        elif fmt == b'tree':
+            c = GitTree # if the object is a tree
+        elif fmt == b'tag':
+            c = GitTag # if the object is a tag
+        elif fmt == b'blob':
+            c = GitBlob # if the object is a blob
+        else:
+            raise Exception("Unknown type {0} for object {1}".format(fmt.decode("ascii"), sha)) # raise an exception    
+
+        # Call constructor and return object
+        return c(raw[y+1:])
+    
+# writing objects
+# writing an object is reading it in reverse
+# 1. compute the object's hash
+# 2. insert the header
+# 3. zlib-compress everything
+# 4. write the result in the correct location
+def object_write(obj, repo=None):
+    # Serialize object data
+    data = obj.serialize()
+    # Add header
+    result = obj.fmt + b' ' + str(len(data)).encode() + b'\x00' + data
+    # Compute hash
+    sha = hashlib.sha1(result).hexdigest()
+
+    if repo:
+        # Compute path
+        path=repo_file(repo, "objects", sha[0:2], sha[2:], mkdir=True)
+
+        if not os.path.exists(path):
+            with open(path, 'wb') as f:
+                # Compress and write
+                f.write(zlib.compress(result))
+    return sha
+
+# working with blobs (git has 4 object types: commit, tree, tag, and blob)
+# blobs are the simplest objects (because they have no actual format)
+# they are user data (all the files are stored as blobs)
+
+class GitBlob(GitObject):
+    fmt=b'blob'
+
+    def serialize(self):
+        return self.blobdata
+
+    def deserialize(self, data):
+        self.blobdata = data
+
+# cat-file command
+argsp = argsubparsers.add_parser("cat-file",
+                                 help="Provide content of repository objects")
+
+argsp.add_argument("type",
+                   metavar="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   help="Specify the type")
+
+argsp.add_argument("object",
+                   metavar="object",
+                   help="The object to display")
+
+def cmd_cat_file(args):
+    repo = repo_find()
+    cat_file(repo, args.object, fmt=args.type.encode())
+
+def cat_file(repo, obj, fmt=None):
+    obj = object_read(repo, object_find(repo, obj, fmt=fmt))
+    sys.stdout.buffer.write(obj.serialize())
+
+def object_find(repo, name, fmt=None, follow=True):
+    return name
+
+# the hash-object command
+argsp = argsubparsers.add_parser(
+    "hash-object",
+    help="Compute object ID and optionally creates a blob from a file")
+
+argsp.add_argument("-t",
+                   metavar="type",
+                   dest="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   default="blob",
+                   help="Specify the type")
+
+argsp.add_argument("-w",
+                   dest="write",
+                   action="store_true",
+                   help="Actually write the object into the database")
+
+argsp.add_argument("path",
+                   help="Read object from <file>")
+
+def cmd_hash_object(args):
+    if args.write:
+        repo = repo_find()
+    else:
+        repo = None
+
+    with open(args.path, "rb") as fd:
+        sha = object_hash(fd, args.type.encode(), repo)
+        print(sha)
+
+def object_hash(fd, fmt, repo=None):
+    """ Hash object, writing it to repo if provided."""
+    data = fd.read()
+
+    # Choose constructor according to fmt argument
+    if fmt == b'commit':
+        obj = GitCommit(data)
+    elif fmt == b'tree':
+        obj = GitTree(data)
+    elif fmt == b'tag':
+        obj = GitTag(data)
+    elif fmt == b'blob':
+        obj = GitBlob(data)
+    else:
+        raise Exception("Unknown type %s!" % fmt)
+
+    return object_write(obj, repo)
+
+############################################################################################
+#---------------------------------- READING COMMIT HISTORY: LOG ---------------------------#
+############################################################################################
+
+# parsing commits
